@@ -1,61 +1,71 @@
 import requests
 from bs4 import BeautifulSoup
 from requests_toolbelt.multipart.encoder import MultipartEncoder
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from pydantic.main import ModelMetaclass
 from datetime import datetime
 import typing
 from urllib.parse import urlparse
-import inspect
 
 class WebworkObjMeta(ModelMetaclass):
     _instances = {}
-    _associated_clients= {}
-
+    
     def __call__(cls, **kwargs):
         if cls not in cls._instances:
             cls._instances[cls] = {}
         
-        link = kwargs.get("link", None)
-        if link is None:
-            raise Exception("link is required")
-
         no_save = kwargs.pop("__no_save", None)
         if no_save is not None:
             return super().__call__(**kwargs)
         
-        if link not in cls._instances[cls]:
-            client = kwargs.pop('__webworkclient')
-            cls._associated_clients[link] = client
-            
-            cls._instances[cls][link] = super().__call__(**kwargs)
-            ins = cls._instances[cls][link]
-        else:
-            ins = cls._instances[cls][link]
-            # updates the instance
-            ins.update(**kwargs)
-        return ins
+        link = kwargs.get("link", None)
+        if link is None:
+            raise Exception("link is required")
+        client = kwargs.get('_webworkclient')
         
+        # santize kwargs[link]
+        if "https" not in link:
+            parsed = urlparse(client.base_url + link)
+            link = f"https://{parsed.netloc}{parsed.path}"
+        
+        kwargs["link"] = link
+        
+        if (link, client) not in cls._instances[cls]:
+            ins = super().__call__(**kwargs) 
+            cls._instances[cls][(link, client)] = ins
+        else:
+            ins = cls._instances[cls][(link, client)]
+            # updates the instance
+            ins.update(**kwargs)        
+        return ins
 
 class Webwork2Obj(BaseModel, metaclass=WebworkObjMeta):
     link : str
     name : str
+    _webworkclient : "Webwork2Client"
     
-    @property
-    def _client(self):
-        return self.__class__._associated_clients[self.link]
-    
+    class Config:
+        arbitrary_types_allowed = True
+        
+    def __init__(self,_webworkclient, **data) -> None:
+        super().__init__(**data)
+        object.__setattr__(self, "_webworkclient", _webworkclient)
+        
     def update(self, **kwargs):
         json_data = self.dict()
         json_data.update(kwargs)
-        newcls = self.__class__(**json_data, __no_save=True)
+        newcls = self.__class__(
+            **json_data, 
+            __no_save=True, 
+        )
+        
         self.__dict__.update(newcls.__dict__)
         
 class Section(Webwork2Obj):
     open : bool
     close : datetime = None
     
-    def __init__(self, link: str, name, raw : str,**kwargs):
+    def __init__(self, link: str, name, raw : str,_webworkclient):
         # status string passed in as Open, closes 12/10/2022 at 11:59pm EST.
         # split on "closes" and then split on "at"
         splitted = raw.split(",")
@@ -70,10 +80,10 @@ class Section(Webwork2Obj):
             close_split =close_split.replace("closes", "")
             close_split = close_split.strip()
             close = datetime.strptime(close_split, "%m/%d/%Y at %I:%M%p EST.")
-        super().__init__(link=link, name=name, open=open, close=close, **kwargs)
+        super().__init__(link=link, name=name, open=open, close=close, _webworkclient=_webworkclient)
 
     def get_problems(self):
-        res = self._client._make_request(self.link)
+        res = self._webworkclient._make_request(self.link)
         soup = BeautifulSoup(res.text, "html.parser")
 
         problems_body = soup.find("div", {"class" : "body span8"})
@@ -103,13 +113,13 @@ class Section(Webwork2Obj):
             percent = float(cols[4].text.strip("%"))
             problems.append(
                 Problem(
-                    link=self._client.base_url+link, 
+                    link=link, 
                     name=name, 
                     attempts=attempts, 
                     remaining=remaining, 
                     worth=worth, 
                     percent_score=percent, 
-                    __webworkclient=self._client
+                    _webworkclient=self._webworkclient
             ))
             
         return problems
@@ -124,11 +134,18 @@ class Problem(Webwork2Obj):
     actual_score : float
     
     def __init__(self, **kwargs) -> None:
-        kwargs["actual_score"] = kwargs["percent_score"] * kwargs["worth"] / 100
-        
+        if "actual_score" not in kwargs:
+            kwargs["actual_score"] = kwargs["percent_score"] * kwargs["worth"] / 100
+    
         super().__init__(
             **kwargs,
         )
+
+    @validator("percent_score")
+    def validate_percent_score(cls, v):
+        if v > 100:
+            raise ValueError("percent score cannot be greater than 100")
+        return v
 
 class Webwork2Client:
     def __init__(self, target :str) -> None:
@@ -165,6 +182,9 @@ class Webwork2Client:
                 querys["effectiveUser"] = cookie.value.split("%09")[0]
             
             kwargs["params"] = querys
+        
+        if "https" not in url:
+            url = self.base_url + url
         
         res = request_func(url, cookies=self._cookie,**kwargs)
         # get the cookie
@@ -213,6 +233,6 @@ class Webwork2Client:
             # get raw status text from last
             raw = tds[-1].text
 
-            sections.append(Section(link=self.base_url+link, name=name, raw=raw, __webworkclient=self))
+            sections.append(Section(link=link, name=name, raw=raw, _webworkclient=self))
         
         return sections
