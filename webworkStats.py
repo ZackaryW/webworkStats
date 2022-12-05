@@ -1,4 +1,3 @@
-from time import sleep
 import requests
 from bs4 import BeautifulSoup
 from requests_toolbelt.multipart.encoder import MultipartEncoder
@@ -7,12 +6,13 @@ from pydantic.main import ModelMetaclass
 from datetime import datetime
 import typing
 from urllib.parse import urlparse
+import inspect
 
 class WebworkObjMeta(ModelMetaclass):
     _instances = {}
     _associated_clients= {}
 
-    def __call__(cls, *args, **kwargs):
+    def __call__(cls, **kwargs):
         if cls not in cls._instances:
             cls._instances[cls] = {}
         
@@ -20,14 +20,22 @@ class WebworkObjMeta(ModelMetaclass):
         if link is None:
             raise Exception("link is required")
 
+        no_save = kwargs.pop("__no_save", None)
+        if no_save is not None:
+            return super().__call__(**kwargs)
         
         if link not in cls._instances[cls]:
             client = kwargs.pop('__webworkclient')
             cls._associated_clients[link] = client
             
-            cls._instances[cls][link] = super().__call__(*args, **kwargs)
+            cls._instances[cls][link] = super().__call__(**kwargs)
+            ins = cls._instances[cls][link]
+        else:
+            ins = cls._instances[cls][link]
+            # updates the instance
+            ins.update(**kwargs)
+        return ins
         
-        return cls._instances[cls][link]
 
 class Webwork2Obj(BaseModel, metaclass=WebworkObjMeta):
     link : str
@@ -36,6 +44,12 @@ class Webwork2Obj(BaseModel, metaclass=WebworkObjMeta):
     @property
     def _client(self):
         return self.__class__._associated_clients[self.link]
+    
+    def update(self, **kwargs):
+        json_data = self.dict()
+        json_data.update(kwargs)
+        newcls = self.__class__(**json_data, __no_save=True)
+        self.__dict__.update(newcls.__dict__)
         
 class Section(Webwork2Obj):
     open : bool
@@ -50,12 +64,16 @@ class Section(Webwork2Obj):
             open = False
         else:
             open = splitted[0].strip() == "Open"
-            close = datetime.strptime(splitted[1].strip(), "closes %m/%d/%Y at %I:%M%p EST.")
+            close_split = splitted[1].strip()
+            # remove complete by or close
+            close_split =close_split.replace("complete by", "")
+            close_split =close_split.replace("closes", "")
+            close_split = close_split.strip()
+            close = datetime.strptime(close_split, "%m/%d/%Y at %I:%M%p EST.")
         super().__init__(link=link, name=name, open=open, close=close, **kwargs)
 
     def get_problems(self):
-        path = self._client.base_url + self.link 
-        res = self._client._make_request(path)
+        res = self._client._make_request(self.link)
         soup = BeautifulSoup(res.text, "html.parser")
 
         problems_body = soup.find("div", {"class" : "body span8"})
@@ -85,7 +103,7 @@ class Section(Webwork2Obj):
             percent = float(cols[4].text.strip("%"))
             problems.append(
                 Problem(
-                    link=link, 
+                    link=self._client.base_url+link, 
                     name=name, 
                     attempts=attempts, 
                     remaining=remaining, 
@@ -106,9 +124,10 @@ class Problem(Webwork2Obj):
     actual_score : float
     
     def __init__(self, **kwargs) -> None:
+        kwargs["actual_score"] = kwargs["percent_score"] * kwargs["worth"] / 100
+        
         super().__init__(
             **kwargs,
-            actual_score=kwargs["percent_score"] * kwargs["worth"] / 100
         )
 
 class Webwork2Client:
@@ -194,7 +213,6 @@ class Webwork2Client:
             # get raw status text from last
             raw = tds[-1].text
 
-            sections.append(Section(link=link, name=name, raw=raw, __webworkclient=self))
+            sections.append(Section(link=self.base_url+link, name=name, raw=raw, __webworkclient=self))
         
         return sections
-
